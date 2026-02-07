@@ -118,6 +118,19 @@ export default function SettingsPanel({
         />
         Auto-play assistant voice
       </label>
+
+      <label className="checkbox-line">
+        <input
+          type="checkbox"
+          checked={settings.showStatusPanel}
+          onChange={(event) =>
+            updateSettings(settings, onChange, {
+              showStatusPanel: event.target.checked
+            })
+          }
+        />
+        Show status/debug panel
+      </label>
     </aside>
   );
 }

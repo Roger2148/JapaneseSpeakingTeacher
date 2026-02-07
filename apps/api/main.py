@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -95,6 +97,11 @@ class AuthUserResponse(BaseModel):
     created: bool = False
 
 
+class TopicWelcomeResponse(BaseModel):
+    message: str
+    topics: list[str]
+
+
 class HistorySaveMessage(BaseModel):
     role: Literal["user", "assistant"]
     text: str = Field(min_length=0, max_length=6000)
@@ -158,7 +165,9 @@ DEFAULT_PROMPT_PROFILE: dict[str, Any] = {
     "global_rules": [
         "Use spoken, chat-like language, not textbook style.",
         "Default behavior: continue the conversation.",
-        "React to what the learner said and ask one follow-up question to keep them talking.",
+        "React to what the learner said and keep the conversation moving.",
+        "Ask follow-up questions often, but not every turn. Sometimes giving short info/feedback is enough.",
+        "Use natural conversation connectors when appropriate (e.g., なるほど, いいね, そうだね).",
         "If correction is needed, keep it short and natural. Prefer inline correction or one short line like '自然な言い方: ...'.",
         "Do not output headings, bullet lists, tables, markdown separators, or code blocks unless the user explicitly asks for that format.",
         "Never reveal chain-of-thought. Keep output clean and learner-friendly.",
@@ -171,9 +180,90 @@ DEFAULT_PROMPT_PROFILE: dict[str, Any] = {
     },
 }
 
+DEFAULT_TOPICS: list[tuple[str, str]] = [
+    ("食べ物", "food,meal,cooking"),
+    ("運動", "exercise,sports,workout"),
+    ("学校", "school,class,study"),
+    ("仕事", "work,job,career"),
+    ("旅行", "travel,trip,vacation"),
+    ("趣味", "hobby,hobbies"),
+    ("映画", "movie,film,cinema"),
+    ("音楽", "music,song,songs"),
+    ("家族", "family,parents,siblings"),
+    ("友達", "friend,friends"),
+    ("健康", "health,healthy"),
+    ("天気", "weather"),
+    ("買い物", "shopping"),
+    ("日本文化", "japanese culture,culture"),
+    ("技術", "technology,tech,ai"),
+    ("ニュース", "news,current events"),
+    ("ペット", "pet,pets,animals"),
+    ("週末", "weekend,day off"),
+    ("将来の夢", "dream,future goal"),
+    ("子どものころ", "childhood"),
+]
+
 
 def contains_japanese(text: str) -> bool:
     return bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff]", text))
+
+
+class TopicStore:
+    def __init__(self) -> None:
+        data_root = Path(__file__).resolve().parent / "data"
+        data_root.mkdir(parents=True, exist_ok=True)
+        self.db_path = data_root / "topics.db"
+        self._lock = threading.RLock()
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(str(self.db_path), timeout=5)
+
+    def _init_db(self) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS topics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    aliases TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            count_row = conn.execute("SELECT COUNT(*) FROM topics").fetchone()
+            current_count = int(count_row[0]) if count_row else 0
+            if current_count == 0:
+                conn.executemany(
+                    "INSERT INTO topics(name, aliases) VALUES (?, ?)",
+                    DEFAULT_TOPICS,
+                )
+            conn.commit()
+
+    def list_topic_entries(self) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("SELECT name, aliases FROM topics ORDER BY name ASC").fetchall()
+        entries: list[dict[str, Any]] = []
+        for row in rows:
+            name = str(row[0]).strip()
+            alias_raw = str(row[1] or "")
+            aliases = [item.strip() for item in alias_raw.split(",") if item.strip()]
+            if name:
+                entries.append({"name": name, "aliases": aliases})
+        return entries
+
+    def random_topic_names(self, count: int = 3) -> list[str]:
+        safe_count = max(1, min(int(count), 10))
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT name FROM topics ORDER BY RANDOM() LIMIT ?",
+                (safe_count,),
+            ).fetchall()
+        names = [str(row[0]).strip() for row in rows if row and str(row[0]).strip()]
+        if names:
+            return names
+        # Defensive fallback if DB is empty.
+        fallback = [name for name, _ in DEFAULT_TOPICS]
+        return fallback[:safe_count]
 
 
 class JsonStateStore:
@@ -339,6 +429,25 @@ class JsonStateStore:
             self._write_state(state)
             return item
 
+    def delete_history_item(self, username: str, item_id: str) -> bool:
+        with self._lock:
+            state = self._read_state()
+            key = username.casefold()
+            bucket = state["history"].get(key, [])
+            if not isinstance(bucket, list):
+                return False
+            before_count = len(bucket)
+            filtered = [
+                entry
+                for entry in bucket
+                if not (isinstance(entry, dict) and str(entry.get("id", "")) == item_id)
+            ]
+            if len(filtered) == before_count:
+                return False
+            state["history"][key] = filtered
+            self._write_state(state)
+            return True
+
 
 class LocalWhisperTranscriber:
     def __init__(self) -> None:
@@ -497,8 +606,107 @@ class LocalOllamaTutor:
         }
         return mapping.get(response_length, 180)
 
+    def _contains_topic_trigger(self, text: str) -> bool:
+        lowered = text.casefold()
+        english_triggers = [
+            "let's talk about",
+            "lets talk about",
+            "talk about",
+            "topic:",
+            "topic is",
+            "can we talk about",
+        ]
+        japanese_triggers = [
+            "について",
+            "を話したい",
+            "を話しましょう",
+            "を話そう",
+            "トピック",
+            "テーマ",
+        ]
+        return any(token in lowered for token in english_triggers) or any(
+            token in text for token in japanese_triggers
+        )
+
+    def _match_topics_in_text(
+        self,
+        text: str,
+        topic_entries: list[dict[str, Any]],
+    ) -> list[str]:
+        if not text.strip():
+            return []
+        lowered = text.casefold()
+        compact = re.sub(r"\s+", "", lowered)
+        matches: list[str] = []
+        for entry in topic_entries:
+            name = str(entry.get("name", "")).strip()
+            if not name:
+                continue
+            aliases_raw = entry.get("aliases", [])
+            aliases: list[str] = []
+            if isinstance(aliases_raw, list):
+                aliases = [str(item).strip() for item in aliases_raw if str(item).strip()]
+
+            candidates = [name, *aliases]
+            found = False
+            for candidate in candidates:
+                candidate_lower = candidate.casefold().strip()
+                if not candidate_lower:
+                    continue
+                if re.fullmatch(r"[a-z0-9 _-]+", candidate_lower):
+                    if len(candidate_lower.replace(" ", "")) < 3:
+                        continue
+                    if re.search(rf"\b{re.escape(candidate_lower)}\b", lowered):
+                        found = True
+                        break
+                else:
+                    candidate_compact = re.sub(r"\s+", "", candidate_lower)
+                    if candidate_compact and (
+                        candidate_lower in lowered or candidate_compact in compact
+                    ):
+                        found = True
+                        break
+            if found and name not in matches:
+                matches.append(name)
+        matches.sort(key=len, reverse=True)
+        return matches
+
+    def _infer_active_topic(
+        self,
+        user_text: str,
+        history: list[ChatTurn],
+        topic_entries: list[dict[str, Any]],
+    ) -> str | None:
+        if not topic_entries:
+            return None
+
+        candidate_texts = [user_text.strip()]
+        for turn in reversed(history):
+            if turn.role != "user":
+                continue
+            cleaned = turn.text.strip()
+            if cleaned:
+                candidate_texts.append(cleaned)
+            if len(candidate_texts) >= 8:
+                break
+
+        for index, text in enumerate(candidate_texts):
+            matches = self._match_topics_in_text(text, topic_entries)
+            if not matches:
+                continue
+            if self._contains_topic_trigger(text):
+                return matches[0]
+            # If latest user message is very short and clearly points to one topic, treat it as selection.
+            if index == 0 and len(matches) == 1 and len(text) <= 28:
+                return matches[0]
+        return None
+
     def _prepare_messages(
-        self, history: list[ChatTurn], user_text: str, settings: TutorSettings
+        self,
+        history: list[ChatTurn],
+        user_text: str,
+        settings: TutorSettings,
+        active_topic: str | None = None,
     ) -> list[dict[str, str]]:
         cleaned_history: list[dict[str, str]] = []
         for turn in history:
@@ -511,6 +719,18 @@ class LocalOllamaTutor:
         messages: list[dict[str, str]] = [
             {"role": "system", "content": self._build_system_prompt(settings)}
         ]
+        if active_topic:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f"Learner selected this conversation topic: {active_topic}. "
+                        "Guide the learner to keep talking about this topic. "
+                        "Ask short follow-up questions, suggest useful topic vocabulary, "
+                        "and give simple prompts that help the learner continue speaking."
+                    ),
+                }
+            )
         messages.extend(trimmed_history)
         messages.append({"role": "user", "content": user_text.strip()})
         return messages
@@ -539,9 +759,130 @@ class LocalOllamaTutor:
         stripped = re.sub(r"\n{2,}", "\n", stripped)
         return stripped.strip()
 
-    def _ensure_follow_up_question(self, text: str, settings: TutorSettings) -> str:
+    def _stable_fraction(self, *parts: str) -> float:
+        seed = "|".join(parts).encode("utf-8", errors="ignore")
+        digest = hashlib.sha256(seed).digest()
+        raw = int.from_bytes(digest[:8], byteorder="big", signed=False)
+        return raw / float((1 << 64) - 1)
+
+    def _user_is_asking_question(self, user_text: str) -> bool:
+        if "?" in user_text or "？" in user_text:
+            return True
+        lowered = user_text.casefold()
+        english_signals = (
+            "what ",
+            "why ",
+            "how ",
+            "when ",
+            "where ",
+            "which ",
+            "can you",
+            "could you",
+            "do you",
+            "is it",
+            "are there",
+        )
+        japanese_signals = (
+            "ですか",
+            "ますか",
+            "かな",
+            "でしょうか",
+            "なんで",
+            "なぜ",
+            "どうして",
+            "どうやって",
+            "何",
+            "どこ",
+            "いつ",
+        )
+        if any(lowered.startswith(signal) for signal in english_signals):
+            return True
+        if any(signal in user_text for signal in japanese_signals):
+            return True
+        return False
+
+    def _maybe_add_conversational_connector(
+        self,
+        text: str,
+        settings: TutorSettings,
+        user_text: str,
+        history: list[ChatTurn],
+    ) -> str:
+        cleaned = text.strip()
+        if not cleaned:
+            return cleaned
+        if settings.tutorStyle == "strict":
+            return cleaned
+
+        if re.match(
+            r"^(なるほど|いいね|そうだね|たしかに|わかる|Oh|I see|That makes sense|Right)\b",
+            cleaned,
+            flags=re.IGNORECASE,
+        ):
+            return cleaned
+
+        base_prob = 0.38 if settings.tutorStyle == "casual" else 0.28
+        if self._user_is_asking_question(user_text):
+            base_prob += 0.08
+        if len(user_text.strip()) > 90:
+            base_prob -= 0.05
+        prob = min(max(base_prob, 0.1), 0.75)
+        score = self._stable_fraction(
+            "connector",
+            settings.tutorStyle,
+            settings.replyLanguage,
+            user_text.strip(),
+            str(len(history)),
+            cleaned[:48],
+        )
+        if score > prob:
+            return cleaned
+
+        if settings.replyLanguage == "en":
+            connector_pool = ["Oh, I see.", "That makes sense.", "Nice."]
+        else:
+            connector_pool = ["なるほど。", "いいね。", "そうだね。", "たしかに。"]
+        pick_score = self._stable_fraction("connector-pick", cleaned, user_text)
+        index = int(pick_score * len(connector_pool)) % len(connector_pool)
+        connector = connector_pool[index]
+        return f"{connector} {cleaned}".strip()
+
+    def _adapt_follow_up_question(
+        self,
+        text: str,
+        settings: TutorSettings,
+        user_text: str,
+        history: list[ChatTurn],
+    ) -> str:
         if "?" in text or "？" in text:
             return text
+
+        base_prob_map = {
+            "casual": 0.72,
+            "balanced": 0.64,
+            "strict": 0.52,
+        }
+        prob = base_prob_map.get(settings.tutorStyle, 0.64)
+        if self._user_is_asking_question(user_text):
+            prob -= 0.22
+        if settings.responseLength == "very_short":
+            prob -= 0.1
+        if len(user_text.strip()) > 90:
+            prob -= 0.08
+        prob = min(max(prob, 0.18), 0.9)
+
+        score = self._stable_fraction(
+            "followup",
+            settings.tutorStyle,
+            settings.replyLanguage,
+            settings.responseLength,
+            user_text.strip(),
+            str(len(history)),
+            text[:48],
+        )
+        if score > prob:
+            return text
+
         follow_up_map = self._prompt_profile().get("follow_up_question", {})
         follow_up = str(
             follow_up_map.get(
@@ -579,12 +920,22 @@ class LocalOllamaTutor:
         return body
 
     def draft_reply(
-        self, user_text: str, settings: TutorSettings, history: list[ChatTurn]
+        self,
+        user_text: str,
+        settings: TutorSettings,
+        history: list[ChatTurn],
+        topic_entries: list[dict[str, Any]] | None = None,
     ) -> dict[str, str]:
+        active_topic = self._infer_active_topic(user_text, history, topic_entries or [])
         payload: dict[str, Any] = {
             "model": self.model,
             "stream": False,
-            "messages": self._prepare_messages(history, user_text, settings),
+            "messages": self._prepare_messages(
+                history,
+                user_text,
+                settings,
+                active_topic=active_topic,
+            ),
             "think": self.enable_thinking,
             "options": {
                 "temperature": self.temperature,
@@ -612,7 +963,8 @@ class LocalOllamaTutor:
             raise RuntimeError("Ollama returned an empty reply after retry.")
         if settings.tutorStyle == "casual":
             text = self._strip_correction_lines_for_casual(text)
-        text = self._ensure_follow_up_question(text, settings)
+        text = self._maybe_add_conversational_connector(text, settings, user_text, history)
+        text = self._adapt_follow_up_question(text, settings, user_text, history)
 
         model_name = str(body.get("model") or self.model)
         return {"text": text, "model": model_name}
@@ -961,6 +1313,7 @@ transcriber = LocalWhisperTranscriber()
 tutor = LocalOllamaTutor()
 speech = LocalSpeechSynthesizer()
 store = JsonStateStore()
+topic_store = TopicStore()
 app.mount("/generated_audio", StaticFiles(directory=str(speech.output_dir)), name="generated_audio")
 
 COOKIE_NAME = os.getenv("AUTH_COOKIE_NAME", "jst_session")
@@ -977,7 +1330,7 @@ cors_origins = [
 ]
 cors_origin_regex = os.getenv(
     "CORS_ALLOW_ORIGIN_REGEX",
-    r"^https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+)(:\d+)?$",
+    r"^https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+)(:\d+)?$",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -1114,13 +1467,26 @@ def auth_me(username: str = Depends(require_username)) -> AuthUserResponse:
     return AuthUserResponse(username=username, created=False)
 
 
+@app.get("/topics/welcome", response_model=TopicWelcomeResponse)
+def topics_welcome(_: str = Depends(require_username)) -> TopicWelcomeResponse:
+    topics = topic_store.random_topic_names(3)
+    topic_text = "、".join(topics)
+    message = (
+        "こんにちは。日本語の会話練習を始めましょう。"
+        f"今回のトピック例: {topic_text}。"
+        "この中から選んでも、別の話題でも大丈夫です。"
+        "「〜について話したいです」と言ってみましょう。"
+    )
+    return TopicWelcomeResponse(message=message, topics=topics)
+
+
 @app.get("/history/list", response_model=list[HistoryItemSummary])
 def history_list(username: str = Depends(require_username)) -> list[HistoryItemSummary]:
     items = store.list_history(username)
     return [
         HistoryItemSummary(
             id=str(item.get("id", "")),
-            title=str(item.get("title", "Untitled")),
+            title=(str(item.get("title", "")).strip() or "Untitled"),
             created_at=str(item.get("created_at", "")),
             message_count=len(item.get("messages", []))
             if isinstance(item.get("messages"), list)
@@ -1147,7 +1513,7 @@ def history_get(item_id: str, username: str = Depends(require_username)) -> Hist
                 continue
     return HistoryItemResponse(
         id=str(item.get("id", "")),
-        title=str(item.get("title", "Untitled")),
+        title=(str(item.get("title", "")).strip() or "Untitled"),
         created_at=str(item.get("created_at", "")),
         messages=messages,
     )
@@ -1170,10 +1536,18 @@ def history_save(
     item = store.save_history(username, payload.title, normalized_messages)
     return HistoryItemSummary(
         id=item["id"],
-        title=item["title"],
+        title=(str(item["title"]).strip() or "Untitled"),
         created_at=item["created_at"],
         message_count=len(normalized_messages),
     )
+
+
+@app.delete("/history/{item_id}")
+def history_delete(item_id: str, username: str = Depends(require_username)) -> dict[str, object]:
+    deleted = store.delete_history_item(username, item_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    return {"status": "ok", "deleted": True, "id": item_id}
 
 
 def file_extension_from_mime(mime_type: str | None) -> str:
@@ -1244,6 +1618,7 @@ async def chat(payload: ChatRequest, _: str = Depends(require_username)) -> Chat
             payload.user_text,
             payload.settings,
             payload.history,
+            topic_store.list_topic_entries(),
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

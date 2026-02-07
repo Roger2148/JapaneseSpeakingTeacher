@@ -4,6 +4,8 @@ import { Message, UserSettings } from "./types";
 
 const SETTINGS_STORAGE_KEY = "jst.settings";
 const LAST_USERNAME_KEY = "jst.last_username";
+const DEFAULT_STARTER_TEXT =
+  "こんにちは。日本語の会話練習を始めましょう。Speak in Japanese or English.";
 
 type WsStatus = "disconnected" | "connecting" | "connected" | "error";
 type SttStatus = "idle" | "transcribing" | "done" | "error";
@@ -29,17 +31,18 @@ const defaultSettings: UserSettings = {
   correctionIntensity: "medium",
   responseLength: "short",
   showLiveTranscript: true,
-  autoPlayAssistantVoice: true
+  autoPlayAssistantVoice: true,
+  showStatusPanel: false
 };
 
 const newId = () => `msg_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 
-const starterMessage: Message = {
+const createStarterMessage = (text: string): Message => ({
   id: newId(),
   role: "assistant",
-  text: "こんにちは。日本語の会話練習を始めましょう。Speak in Japanese or English.",
+  text: text.trim() || DEFAULT_STARTER_TEXT,
   createdAt: new Date().toISOString()
-};
+});
 
 function readSettings(): UserSettings {
   const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
@@ -96,8 +99,9 @@ function buildWsUrl(): string {
     return `${protocol}//${parsed.host}/ws/audio`;
   }
 
-  const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
-  return `${wsProtocol}://${window.location.hostname}:8000/ws/audio`;
+  const parsed = new URL(buildApiBaseUrl());
+  const protocol = parsed.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${parsed.host}/ws/audio`;
 }
 
 function buildApiBaseUrl(): string {
@@ -105,7 +109,11 @@ function buildApiBaseUrl(): string {
   if (explicitUrl) {
     return explicitUrl;
   }
-  return `${window.location.protocol}//${window.location.hostname}:8000`;
+
+  const explicitPort = String(import.meta.env.VITE_API_PORT ?? "").trim();
+  const defaultPort = window.location.protocol === "https:" ? "8443" : "8000";
+  const port = /^\d+$/.test(explicitPort) ? explicitPort : defaultPort;
+  return `${window.location.protocol}//${window.location.hostname}:${port}`;
 }
 
 function toAbsoluteApiUrl(apiBaseUrl: string, maybeRelativeUrl: string): string {
@@ -140,6 +148,17 @@ function blobToBase64(blob: Blob): Promise<string> {
     };
     reader.readAsDataURL(blob);
   });
+}
+
+function displayHistoryTitle(item: HistorySummary): string {
+  const clean = (item.title ?? "").trim();
+  if (clean) {
+    return clean;
+  }
+  if (item.created_at) {
+    return `Conversation ${new Date(item.created_at).toLocaleString()}`;
+  }
+  return "Untitled conversation";
 }
 
 function getMicSupportDetail(): string {
@@ -205,7 +224,10 @@ export default function App() {
   const [isDebugOpen, setIsDebugOpen] = useState(false);
   const [playingMessageId, setPlayingMessageId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
-  const [messages, setMessages] = useState<Message[]>([starterMessage]);
+  const [starterText, setStarterText] = useState(DEFAULT_STARTER_TEXT);
+  const [messages, setMessages] = useState<Message[]>([
+    createStarterMessage(DEFAULT_STARTER_TEXT)
+  ]);
   const [isAssistantTyping, setIsAssistantTyping] = useState(false);
   const [saveStatus, setSaveStatus] = useState("");
   const threadRef = useRef<HTMLElement | null>(null);
@@ -318,15 +340,41 @@ export default function App() {
     setBackendSessionId("-");
   }, [settleRecordingStartAck]);
 
-  const resetConversationToStarter = useCallback(() => {
-    setMessages([starterMessage]);
-    setDraft("");
-    setPendingVoiceCapture(null);
-    setLastTranscript("-");
-    setLiveTranscript("");
-    setIsAssistantTyping(false);
-    setPlayingMessageId(null);
-  }, []);
+  const resetConversationToStarter = useCallback(
+    (text?: string) => {
+      const resolvedText = (text ?? starterText).trim() || DEFAULT_STARTER_TEXT;
+      setStarterText(resolvedText);
+      setMessages([createStarterMessage(resolvedText)]);
+      setDraft("");
+      setPendingVoiceCapture(null);
+      setLastTranscript("-");
+      setLiveTranscript("");
+      setIsAssistantTyping(false);
+      setPlayingMessageId(null);
+    },
+    [starterText]
+  );
+
+  const fetchWelcomeStarterText = useCallback(async (): Promise<string> => {
+    try {
+      const response = await fetch(`${apiBaseUrl}/topics/welcome`, {
+        method: "GET",
+        credentials: "include"
+      });
+      if (!response.ok) {
+        return DEFAULT_STARTER_TEXT;
+      }
+      const payload = (await response.json()) as { message?: string };
+      const text =
+        typeof payload.message === "string" && payload.message.trim()
+          ? payload.message.trim()
+          : DEFAULT_STARTER_TEXT;
+      setStarterText(text);
+      return text;
+    } catch {
+      return DEFAULT_STARTER_TEXT;
+    }
+  }, [apiBaseUrl]);
 
   const handleUnauthorized = useCallback(() => {
     closeWebSocket();
@@ -335,7 +383,8 @@ export default function App() {
     setHistoryItems([]);
     setHistoryError("");
     setAuthError("Session expired. Please log in again.");
-    resetConversationToStarter();
+    setStarterText(DEFAULT_STARTER_TEXT);
+    resetConversationToStarter(DEFAULT_STARTER_TEXT);
   }, [closeWebSocket, resetConversationToStarter]);
 
   const loadHistoryList = useCallback(
@@ -423,6 +472,11 @@ export default function App() {
       if (!isAuthed) {
         return;
       }
+      if (!itemId || !itemId.trim()) {
+        setSaveStatus("Open failed: invalid conversation id.");
+        clearSaveStatusLater();
+        return;
+      }
       setHistoryLoading(true);
       setHistoryError("");
       try {
@@ -469,20 +523,64 @@ export default function App() {
                 }))
                 .filter((message) => message.text.length > 0)
             : [];
-        if (nextMessages.length > 0) {
-          setMessages(nextMessages);
-          setIsHistoryOpen(false);
-          setSaveStatus("Loaded saved conversation.");
-          clearSaveStatusLater();
-        }
+        setMessages(
+          nextMessages.length > 0
+            ? nextMessages
+            : [createStarterMessage(starterText)]
+        );
+        setDraft("");
+        setPendingVoiceCapture(null);
+        setLastTranscript("-");
+        setLiveTranscript("");
+        setIsHistoryOpen(false);
+        setSaveStatus(
+          nextMessages.length > 0
+            ? "Loaded saved conversation."
+            : "Loaded conversation (no messages found in that record)."
+        );
+        clearSaveStatusLater();
       } catch (error) {
         const detail = error instanceof Error ? error.message : "Unknown error";
         setHistoryError(`History load failed: ${detail}`);
+        setSaveStatus(`Open failed: ${detail}`);
+        clearSaveStatusLater();
       } finally {
         setHistoryLoading(false);
       }
     },
-    [apiBaseUrl, handleUnauthorized]
+    [apiBaseUrl, handleUnauthorized, starterText]
+  );
+
+  const deleteHistoryConversation = useCallback(
+    async (itemId: string) => {
+      if (!isAuthed) {
+        return;
+      }
+      setHistoryLoading(true);
+      setHistoryError("");
+      try {
+        const response = await fetch(`${apiBaseUrl}/history/${itemId}`, {
+          method: "DELETE",
+          credentials: "include"
+        });
+        if (response.status === 401) {
+          handleUnauthorized();
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        setHistoryItems((current) => current.filter((item) => item.id !== itemId));
+        setSaveStatus("Deleted saved conversation.");
+        clearSaveStatusLater();
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : "Unknown error";
+        setHistoryError(`History delete failed: ${detail}`);
+      } finally {
+        setHistoryLoading(false);
+      }
+    },
+    [apiBaseUrl, handleUnauthorized, isAuthed]
   );
 
   const checkAuthSession = useCallback(async () => {
@@ -507,13 +605,15 @@ export default function App() {
       }
       setAuthUsername(data.username);
       setAuthStatus("authed");
+      const welcomeText = await fetchWelcomeStarterText();
+      resetConversationToStarter(welcomeText);
       void loadHistoryList(true);
     } catch (error) {
       const detail = error instanceof Error ? error.message : "Unknown error";
       setAuthError(`Auth check failed: ${detail}`);
       setAuthStatus("guest");
     }
-  }, [apiBaseUrl, loadHistoryList]);
+  }, [apiBaseUrl, fetchWelcomeStarterText, loadHistoryList, resetConversationToStarter]);
 
   const loginWithUsername = useCallback(async () => {
     const username = authInput.trim();
@@ -550,14 +650,21 @@ export default function App() {
       setAuthUsername(resolvedUsername);
       setAuthInput(resolvedUsername);
       setAuthStatus("authed");
-      resetConversationToStarter();
+      const welcomeText = await fetchWelcomeStarterText();
+      resetConversationToStarter(welcomeText);
       void loadHistoryList(true);
     } catch (error) {
       const detail = error instanceof Error ? error.message : "Unknown error";
       setAuthError(`Login failed: ${detail}`);
       setAuthStatus("guest");
     }
-  }, [apiBaseUrl, authInput, loadHistoryList, resetConversationToStarter]);
+  }, [
+    apiBaseUrl,
+    authInput,
+    fetchWelcomeStarterText,
+    loadHistoryList,
+    resetConversationToStarter
+  ]);
 
   const logout = useCallback(async () => {
     try {
@@ -1619,6 +1726,16 @@ export default function App() {
     void startRecording();
   };
 
+  const startNewConversation = () => {
+    const run = async () => {
+      const welcomeText = await fetchWelcomeStarterText();
+      resetConversationToStarter(welcomeText);
+      setSaveStatus("Started a new conversation. Saved history is unchanged.");
+      clearSaveStatusLater();
+    };
+    void run();
+  };
+
   const hasPendingVoiceDecision = !!pendingVoiceCapture && !isRecording;
   const pendingDraftText = draft.trim();
   const pendingSttText = pendingVoiceCapture?.sttText.trim() ?? "";
@@ -1670,10 +1787,13 @@ export default function App() {
       <header className="top-bar">
         <div>
           <p className="eyebrow">Japanese Speaking Teacher</p>
-          <h1>M10: Login + Save/History + HTTPS Baseline</h1>
+          <h1>Conversation Studio</h1>
         </div>
         <div className="top-actions">
           <span className="user-chip">{authUsername}</span>
+          <button className="ghost-button" onClick={startNewConversation}>
+            New Chat
+          </button>
           <button className="ghost-button" onClick={() => setIsHistoryOpen(true)}>
             History
           </button>
@@ -1709,216 +1829,232 @@ export default function App() {
               <p>{chunkCount} chunks captured</p>
             </div>
           </article>
+          <button
+            type="button"
+            className="live-overlay-stop"
+            onClick={stopRecording}
+          >
+            Stop Recording ({recordingSeconds.toFixed(1)}s)
+          </button>
         </section>
       ) : null}
 
-      <main className="chat-shell">
-        <div className="status-row">
-          <p>{statusText}</p>
-          <p>
-            Session is unsaved by default. Use Save to export or keep conversation.
-          </p>
-        </div>
-        <section className="debug-summary">
-          <p>WS: {backendWsStatus}</p>
-          <p>Session: {backendSessionId}</p>
-          <p>Event: {backendEvent}</p>
-          <p>STT: {sttStatus}</p>
-          <p>LLM: {llmStatus}</p>
-          <p>TTS: {ttsStatus}</p>
-          <p>Live: {settings.showLiveTranscript ? "on" : "off"}</p>
-          <button
-            className="ghost-button"
-            type="button"
-            onClick={() => setIsDebugOpen((current) => !current)}
-          >
-            {isDebugOpen ? "Hide Debug" : "Show Debug"}
-          </button>
-        </section>
-        {isDebugOpen ? (
-          <section className="mic-debug">
-            <p>Mic support: {micSupported ? "Supported" : "Unsupported"}</p>
-            <p>Permission: {micPermission}</p>
-            <p>Duration: {recordingSeconds.toFixed(1)}s</p>
-            <p>Chunks: {chunkCount}</p>
-            <p>Last audio: {formatBytes(lastAudioBytes)}</p>
-            <p>Mime: {lastMimeType}</p>
-            <p>WS status: {backendWsStatus}</p>
-            <p>WS session: {backendSessionId}</p>
-            <p>Server chunks: {backendChunks}</p>
-            <p>Server bytes: {formatBytes(backendBytes)}</p>
-            <p>STT status: {sttStatus}</p>
-            <p>STT latency: {sttLatencyMs ? `${sttLatencyMs} ms` : "-"}</p>
-            <p>LLM status: {llmStatus}</p>
-            <p>LLM latency: {llmLatencyMs ? `${llmLatencyMs} ms` : "-"}</p>
-            <p className="mic-debug-span">LLM model: {llmModelName}</p>
-            <p>TTS status: {ttsStatus}</p>
-            <p>TTS latency: {ttsLatencyMs ? `${ttsLatencyMs} ms` : "-"}</p>
-            <p className="mic-debug-span">TTS provider: {ttsProvider}</p>
-            <p className="mic-debug-span">TTS voice: {ttsVoice}</p>
-            <p className="mic-debug-span">Last backend event: {backendEvent}</p>
-            <p className="mic-debug-span">Last transcript: {lastTranscript}</p>
-            <p className="mic-debug-span">Live transcript: {liveTranscript || "-"}</p>
-            <div className="mic-debug-action">
-              <button className="ghost-button" type="button" onClick={reconnectWebSocket}>
-                Reconnect WS
-              </button>
+      <main className={`chat-shell ${settings.showStatusPanel ? "" : "single-pane"}`}>
+        {settings.showStatusPanel ? (
+          <aside className="control-rail">
+            <div className="status-row">
+              <p>{statusText}</p>
+              <p>
+                Session is unsaved by default. Use Save to export or keep conversation.
+              </p>
             </div>
-            <div className="audio-meter">
-              <span>Input level</span>
-              <div className="audio-meter-track">
-                <div
-                  className="audio-meter-fill"
-                  style={{ width: `${Math.max(2, Math.round(audioLevel * 100))}%` }}
-                />
-              </div>
-            </div>
-            {audioPreviewUrl ? (
-              <div className="audio-preview">
-                <span>Last capture preview</span>
-                <audio controls src={audioPreviewUrl} />
-              </div>
-            ) : null}
-            {micError ? <p className="mic-error">{micError}</p> : null}
-          </section>
-        ) : null}
-        {saveStatus ? <p className="save-status">{saveStatus}</p> : null}
-        {micError && !isDebugOpen ? <p className="mic-error-banner">{micError}</p> : null}
-
-        <section className="thread" aria-live="polite" ref={threadRef}>
-          {messages.map((message) => (
-            <article
-              key={message.id}
-              className={`bubble ${message.role === "user" ? "user" : "assistant"}`}
-            >
-              {message.kind === "voice" && message.audioUrl ? (
-                <>
-                  <div className="voice-row">
-                    <button
-                      type="button"
-                      className="voice-play-button"
-                      onClick={() => togglePlayMessageAudio(message.id)}
-                    >
-                      {playingMessageId === message.id ? "■" : "▶"}
-                    </button>
-                    <div className="voice-text">
-                      <p>{message.text}</p>
-                      {message.audioDurationSec ? (
-                        <p className="voice-meta">
-                          Voice · {formatDuration(message.audioDurationSec)}
-                        </p>
-                      ) : null}
-                    </div>
-                  </div>
-                  {message.sttText && message.sttText.trim() !== message.text.trim() ? (
-                    <p className="voice-stt-line">STT: {message.sttText}</p>
-                  ) : null}
-                  <audio
-                    ref={(element) => {
-                      messageAudioElementMapRef.current[message.id] = element;
-                    }}
-                    src={message.audioUrl}
-                    onLoadedMetadata={(event) => {
-                      const duration = event.currentTarget.duration;
-                      if (!Number.isFinite(duration) || duration <= 0) {
-                        return;
-                      }
-                      setMessages((current) =>
-                        current.map((item) =>
-                          item.id === message.id && !item.audioDurationSec
-                            ? {
-                                ...item,
-                                audioDurationSec: duration
-                              }
-                            : item
-                        )
-                      );
-                    }}
-                    onEnded={() => {
-                      if (playingMessageId === message.id) {
-                        setPlayingMessageId(null);
-                      }
-                    }}
-                    onPause={() => {
-                      if (playingMessageId === message.id) {
-                        setPlayingMessageId(null);
-                      }
-                    }}
-                    preload="metadata"
-                  />
-                </>
-              ) : (
-                <p>{message.text}</p>
-              )}
-            </article>
-          ))}
-          {isAssistantTyping ? <p className="typing">Assistant is drafting...</p> : null}
-        </section>
-
-        {hasPendingVoiceDecision ? (
-          <section className="post-record-panel" aria-live="polite">
-            <p className="post-record-text">
-              Voice captured ({formatDuration(pendingVoiceCapture?.durationSec ?? 0)}). Choose:
-              Re-record, edit text, or send.
-            </p>
-            <div className="post-record-actions">
+            <section className="debug-summary">
+              <p>WS: {backendWsStatus}</p>
+              <p>Session: {backendSessionId}</p>
+              <p>Event: {backendEvent}</p>
+              <p>STT: {sttStatus}</p>
+              <p>LLM: {llmStatus}</p>
+              <p>TTS: {ttsStatus}</p>
+              <p>Live: {settings.showLiveTranscript ? "on" : "off"}</p>
               <button
-                type="button"
                 className="ghost-button"
-                onClick={reRecordAfterCapture}
-                disabled={isMicBusy || isAssistantTyping}
-              >
-                Re-record
-              </button>
-              <button type="button" className="ghost-button" onClick={focusComposerInput}>
-                Edit text
-              </button>
-              <button
                 type="button"
-                onClick={() => {
-                  void submitComposerMessage();
-                }}
-                disabled={!canSendPendingCapture}
+                onClick={() => setIsDebugOpen((current) => !current)}
               >
-                Send now
+                {isDebugOpen ? "Hide Debug" : "Show Debug"}
               </button>
-            </div>
-          </section>
+            </section>
+            {isDebugOpen ? (
+              <section className="mic-debug">
+                <p>Mic support: {micSupported ? "Supported" : "Unsupported"}</p>
+                <p>Permission: {micPermission}</p>
+                <p>Duration: {recordingSeconds.toFixed(1)}s</p>
+                <p>Chunks: {chunkCount}</p>
+                <p>Last audio: {formatBytes(lastAudioBytes)}</p>
+                <p>Mime: {lastMimeType}</p>
+                <p>WS status: {backendWsStatus}</p>
+                <p>WS session: {backendSessionId}</p>
+                <p>Server chunks: {backendChunks}</p>
+                <p>Server bytes: {formatBytes(backendBytes)}</p>
+                <p>STT status: {sttStatus}</p>
+                <p>STT latency: {sttLatencyMs ? `${sttLatencyMs} ms` : "-"}</p>
+                <p>LLM status: {llmStatus}</p>
+                <p>LLM latency: {llmLatencyMs ? `${llmLatencyMs} ms` : "-"}</p>
+                <p className="mic-debug-span">LLM model: {llmModelName}</p>
+                <p>TTS status: {ttsStatus}</p>
+                <p>TTS latency: {ttsLatencyMs ? `${ttsLatencyMs} ms` : "-"}</p>
+                <p className="mic-debug-span">TTS provider: {ttsProvider}</p>
+                <p className="mic-debug-span">TTS voice: {ttsVoice}</p>
+                <p className="mic-debug-span">Last backend event: {backendEvent}</p>
+                <p className="mic-debug-span">Last transcript: {lastTranscript}</p>
+                <p className="mic-debug-span">Live transcript: {liveTranscript || "-"}</p>
+                <div className="mic-debug-action">
+                  <button className="ghost-button" type="button" onClick={reconnectWebSocket}>
+                    Reconnect WS
+                  </button>
+                </div>
+                <div className="audio-meter">
+                  <span>Input level</span>
+                  <div className="audio-meter-track">
+                    <div
+                      className="audio-meter-fill"
+                      style={{ width: `${Math.max(2, Math.round(audioLevel * 100))}%` }}
+                    />
+                  </div>
+                </div>
+                {audioPreviewUrl ? (
+                  <div className="audio-preview">
+                    <span>Last capture preview</span>
+                    <audio controls src={audioPreviewUrl} />
+                  </div>
+                ) : null}
+                {micError ? <p className="mic-error">{micError}</p> : null}
+              </section>
+            ) : null}
+          </aside>
         ) : null}
 
-        <form className="composer" onSubmit={sendMessage}>
-          <button
-            type="button"
-            className={`record-button ${isRecording ? "active" : ""}`}
-            disabled={isMicBusy}
-            onClick={() => {
-              if (isRecording) {
-                stopRecording();
-              } else {
-                void startRecording();
-              }
-            }}
-          >
-            {isMicBusy
-              ? "Starting..."
-              : isRecording
-                ? `Stop Recording (${recordingSeconds.toFixed(1)}s)`
-                : micSupported
-                  ? "Start Recording"
-                  : "Mic Unavailable"}
-          </button>
-          <input
-            ref={composerInputRef}
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            placeholder="Type Japanese or English..."
-            aria-label="Message"
-            disabled={isAssistantTyping}
-          />
-          <button type="submit" disabled={isAssistantTyping}>
-            {isAssistantTyping ? "Thinking..." : "Send"}
-          </button>
-        </form>
+        <section className="conversation-pane">
+          {saveStatus ? <p className="save-status">{saveStatus}</p> : null}
+          {micError && (!settings.showStatusPanel || !isDebugOpen) ? (
+            <p className="mic-error-banner">{micError}</p>
+          ) : null}
+
+          <section className="thread" aria-live="polite" ref={threadRef}>
+            {messages.map((message) => (
+              <article
+                key={message.id}
+                className={`bubble ${message.role === "user" ? "user" : "assistant"}`}
+              >
+                {message.kind === "voice" && message.audioUrl ? (
+                  <>
+                    <div className="voice-row">
+                      <button
+                        type="button"
+                        className="voice-play-button"
+                        onClick={() => togglePlayMessageAudio(message.id)}
+                      >
+                        {playingMessageId === message.id ? "■" : "▶"}
+                      </button>
+                      <div className="voice-text">
+                        <p>{message.text}</p>
+                        {message.audioDurationSec ? (
+                          <p className="voice-meta">
+                            Voice · {formatDuration(message.audioDurationSec)}
+                          </p>
+                        ) : null}
+                      </div>
+                    </div>
+                    {message.sttText && message.sttText.trim() !== message.text.trim() ? (
+                      <p className="voice-stt-line">STT: {message.sttText}</p>
+                    ) : null}
+                    <audio
+                      ref={(element) => {
+                        messageAudioElementMapRef.current[message.id] = element;
+                      }}
+                      src={message.audioUrl}
+                      onLoadedMetadata={(event) => {
+                        const duration = event.currentTarget.duration;
+                        if (!Number.isFinite(duration) || duration <= 0) {
+                          return;
+                        }
+                        setMessages((current) =>
+                          current.map((item) =>
+                            item.id === message.id && !item.audioDurationSec
+                              ? {
+                                  ...item,
+                                  audioDurationSec: duration
+                                }
+                              : item
+                          )
+                        );
+                      }}
+                      onEnded={() => {
+                        if (playingMessageId === message.id) {
+                          setPlayingMessageId(null);
+                        }
+                      }}
+                      onPause={() => {
+                        if (playingMessageId === message.id) {
+                          setPlayingMessageId(null);
+                        }
+                      }}
+                      preload="metadata"
+                    />
+                  </>
+                ) : (
+                  <p>{message.text}</p>
+                )}
+              </article>
+            ))}
+            {isAssistantTyping ? <p className="typing">Assistant is drafting...</p> : null}
+          </section>
+
+          {hasPendingVoiceDecision ? (
+            <section className="post-record-panel" aria-live="polite">
+              <p className="post-record-text">
+                Voice captured ({formatDuration(pendingVoiceCapture?.durationSec ?? 0)}). Choose:
+                Re-record, edit text, or send.
+              </p>
+              <div className="post-record-actions">
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={reRecordAfterCapture}
+                  disabled={isMicBusy || isAssistantTyping}
+                >
+                  Re-record
+                </button>
+                <button type="button" className="ghost-button" onClick={focusComposerInput}>
+                  Edit text
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void submitComposerMessage();
+                  }}
+                  disabled={!canSendPendingCapture}
+                >
+                  Send now
+                </button>
+              </div>
+            </section>
+          ) : null}
+
+          <form className="composer" onSubmit={sendMessage}>
+            <button
+              type="button"
+              className={`record-button ${isRecording ? "active" : ""}`}
+              disabled={isMicBusy}
+              onClick={() => {
+                if (isRecording) {
+                  stopRecording();
+                } else {
+                  void startRecording();
+                }
+              }}
+            >
+              {isMicBusy
+                ? "Starting..."
+                : isRecording
+                  ? `Stop Recording (${recordingSeconds.toFixed(1)}s)`
+                  : micSupported
+                    ? "Start Recording"
+                    : "Mic Unavailable"}
+            </button>
+            <input
+              ref={composerInputRef}
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              placeholder="Type Japanese or English..."
+              aria-label="Message"
+              disabled={isAssistantTyping}
+            />
+            <button type="submit" disabled={isAssistantTyping}>
+              {isAssistantTyping ? "Thinking..." : "Send"}
+            </button>
+          </form>
+        </section>
       </main>
 
       <SettingsPanel
@@ -1962,18 +2098,36 @@ export default function App() {
               <p>No saved conversations yet.</p>
             ) : null}
             {historyItems.map((item) => (
-              <button
-                key={item.id}
-                className="history-item"
-                onClick={() => {
-                  void loadHistoryConversation(item.id);
-                }}
-              >
-                <span>{item.title}</span>
-                <span>
-                  {new Date(item.created_at).toLocaleString()} · {item.message_count} msgs
-                </span>
-              </button>
+              <article key={item.id} className="history-item">
+                <div className="history-meta">
+                  <p className="history-title">{displayHistoryTitle(item)}</p>
+                  <p className="history-subtitle">
+                    {new Date(item.created_at).toLocaleString()} · {item.message_count} msgs
+                  </p>
+                </div>
+                <div className="history-actions">
+                  <button
+                    className="ghost-button history-open-btn"
+                    onClick={() => {
+                      setSaveStatus("Opening saved conversation...");
+                      void loadHistoryConversation(item.id);
+                    }}
+                  >
+                    Open
+                  </button>
+                  <button
+                    className="ghost-button history-delete"
+                    onClick={() => {
+                      if (!window.confirm("Delete this saved conversation?")) {
+                        return;
+                      }
+                      void deleteHistoryConversation(item.id);
+                    }}
+                  >
+                    Delete
+                  </button>
+                </div>
+              </article>
             ))}
           </section>
         </div>

@@ -10,6 +10,7 @@ export interface UserSettings {
   responseLength: ResponseLength;
   showLiveTranscript: boolean;
   autoPlayAssistantVoice: boolean;
+  showStatusPanel: boolean;
 }
 
 export interface Message {

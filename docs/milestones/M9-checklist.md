@@ -32,15 +32,20 @@ Verify unsaved-by-default behavior and all three save options.
 - Open `History`.
 - New saved item should appear.
 
-4. Reload visibility for saved sessions
+4. Load + continue + delete
+- In `History`, click one saved item.
+- Conversation should load into chat and be ready to continue.
+- Delete one saved item and confirm it disappears from list.
+
+5. Reload visibility for saved sessions
 - Reload page and log in again with same username.
 - Saved conversation should remain accessible in `History`.
 
-5. Unsaved-by-default behavior
+6. Unsaved-by-default behavior
 - Start new conversation and do not click save.
 - Reload page.
 - Unsaved conversation should not be auto-persisted.
 
 ## Exit Criteria
 
-Milestone 9 is done only if all five tests pass.
+Milestone 9 is done only if all six tests pass.

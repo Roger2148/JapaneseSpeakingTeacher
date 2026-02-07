@@ -11,6 +11,7 @@ CERT_DIR="${CERT_DIR:-${ROOT_DIR}/deploy/certs}"
 CERT_FILE="${CERT_FILE:-${CERT_DIR}/dev-cert.pem}"
 KEY_FILE="${KEY_FILE:-${CERT_DIR}/dev-key.pem}"
 LAN_HOST="${LAN_HOST:-}"
+TAILSCALE_HOST="${TAILSCALE_HOST:-}"
 
 if [ -z "${LAN_HOST}" ]; then
   LAN_HOST="$(ipconfig getifaddr en0 2>/dev/null || true)"
@@ -21,7 +22,19 @@ fi
 if [ -z "${LAN_HOST}" ]; then
   LAN_HOST="127.0.0.1"
 fi
-ALLOWED_HOSTS_VALUE="${ALLOWED_HOSTS:-localhost,127.0.0.1,${LAN_HOST}}"
+
+if [ -z "${TAILSCALE_HOST}" ] && command -v tailscale >/dev/null 2>&1; then
+  TAILSCALE_HOST="$(tailscale ip -4 2>/dev/null | head -n 1 || true)"
+fi
+
+HOST_VALUES=("localhost" "127.0.0.1")
+if [ -n "${LAN_HOST}" ]; then
+  HOST_VALUES+=("${LAN_HOST}")
+fi
+if [ -n "${TAILSCALE_HOST}" ]; then
+  HOST_VALUES+=("${TAILSCALE_HOST}")
+fi
+ALLOWED_HOSTS_VALUE="${ALLOWED_HOSTS:-$(printf "%s\n" "${HOST_VALUES[@]}" | awk '!seen[$0]++' | paste -sd, -)}"
 
 if ! command -v npm >/dev/null 2>&1; then
   echo "[dev-https] npm not found. Install Node/npm first."
@@ -50,8 +63,30 @@ if [ ! -d "${ROOT_DIR}/apps/web/node_modules" ]; then
 fi
 
 mkdir -p "${CERT_DIR}"
+SAN_ENTRIES=("DNS:localhost" "IP:127.0.0.1")
+if [ -n "${LAN_HOST}" ] && [ "${LAN_HOST}" != "127.0.0.1" ]; then
+  SAN_ENTRIES+=("IP:${LAN_HOST}")
+fi
+if [ -n "${TAILSCALE_HOST}" ] && [ "${TAILSCALE_HOST}" != "127.0.0.1" ] && [ "${TAILSCALE_HOST}" != "${LAN_HOST}" ]; then
+  SAN_ENTRIES+=("IP:${TAILSCALE_HOST}")
+fi
+SAN_CSV="$(IFS=,; echo "${SAN_ENTRIES[*]}")"
+
+NEEDS_CERT_REGEN=0
 if [ ! -f "${CERT_FILE}" ] || [ ! -f "${KEY_FILE}" ]; then
-  echo "[dev-https] generating self-signed cert for localhost + ${LAN_HOST}"
+  NEEDS_CERT_REGEN=1
+else
+  CERT_TEXT="$(openssl x509 -in "${CERT_FILE}" -noout -text 2>/dev/null || true)"
+  if ! grep -q "IP Address:${LAN_HOST}" <<< "${CERT_TEXT}"; then
+    NEEDS_CERT_REGEN=1
+  fi
+  if [ -n "${TAILSCALE_HOST}" ] && ! grep -q "IP Address:${TAILSCALE_HOST}" <<< "${CERT_TEXT}"; then
+    NEEDS_CERT_REGEN=1
+  fi
+fi
+
+if [ "${NEEDS_CERT_REGEN}" -eq 1 ]; then
+  echo "[dev-https] generating self-signed cert with SAN: ${SAN_CSV}"
   if openssl req \
     -x509 \
     -newkey rsa:2048 \
@@ -61,7 +96,7 @@ if [ ! -f "${CERT_FILE}" ] || [ ! -f "${KEY_FILE}" ]; then
     -keyout "${KEY_FILE}" \
     -out "${CERT_FILE}" \
     -subj "/CN=localhost" \
-    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:${LAN_HOST}"; then
+    -addext "subjectAltName=${SAN_CSV}"; then
     true
   else
     SAN_FILE="${CERT_DIR}/openssl-san.cnf"
@@ -75,7 +110,7 @@ prompt=no
 CN=localhost
 
 [v3_req]
-subjectAltName=DNS:localhost,IP:127.0.0.1,IP:${LAN_HOST}
+subjectAltName=${SAN_CSV}
 EOF
     openssl req \
       -x509 \
@@ -104,7 +139,9 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-echo "[dev-https] starting API on https://${LAN_HOST}:${API_PORT}"
+PRIMARY_HOST="${TAILSCALE_HOST:-${LAN_HOST}}"
+
+echo "[dev-https] starting API on https://${PRIMARY_HOST}:${API_PORT}"
 ALLOWED_HOSTS="${ALLOWED_HOSTS_VALUE}" AUTH_COOKIE_SECURE=true conda run -n "${CONDA_ENV_NAME}" \
   uvicorn main:app \
   --app-dir "${ROOT_DIR}/apps/api" \
@@ -116,10 +153,10 @@ ALLOWED_HOSTS="${ALLOWED_HOSTS_VALUE}" AUTH_COOKIE_SECURE=true conda run -n "${C
   --ssl-certfile "${CERT_FILE}" &
 API_PID="$!"
 
-echo "[dev-https] starting web on https://${LAN_HOST}:${WEB_PORT}"
+echo "[dev-https] starting web on https://${PRIMARY_HOST}:${WEB_PORT}"
 (
   cd "${ROOT_DIR}/apps/web"
-  VITE_API_BASE_URL="https://${LAN_HOST}:${API_PORT}" \
+  VITE_API_PORT="${API_PORT}" \
   VITE_DEV_HTTPS_KEY="${KEY_FILE}" \
   VITE_DEV_HTTPS_CERT="${CERT_FILE}" \
     npm run dev -- --host "${WEB_HOST}" --port "${WEB_PORT}" --strictPort
@@ -127,8 +164,14 @@ echo "[dev-https] starting web on https://${LAN_HOST}:${WEB_PORT}"
 WEB_PID="$!"
 
 echo "[dev-https] running. Press Ctrl+C to stop both."
-echo "[dev-https] API: https://${LAN_HOST}:${API_PORT}"
-echo "[dev-https] Web: https://${LAN_HOST}:${WEB_PORT}"
+echo "[dev-https] API: https://${PRIMARY_HOST}:${API_PORT}"
+echo "[dev-https] Web: https://${PRIMARY_HOST}:${WEB_PORT}"
+if [ -n "${LAN_HOST}" ] && [ "${PRIMARY_HOST}" != "${LAN_HOST}" ]; then
+  echo "[dev-https] LAN Web: https://${LAN_HOST}:${WEB_PORT}"
+fi
+if [ -n "${TAILSCALE_HOST}" ]; then
+  echo "[dev-https] Tailscale Web: https://${TAILSCALE_HOST}:${WEB_PORT}"
+fi
 echo "[dev-https] note: self-signed cert; trust cert on phone to unlock mic."
 
 while true; do
