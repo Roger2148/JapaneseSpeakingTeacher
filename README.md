@@ -14,6 +14,28 @@ You speak (Japanese or English), the app transcribes your voice, generates a tut
 - Optional live transcript overlay during recording.
 - Topic-based conversation starters with random topic suggestions.
 
+## Core Functions
+
+- Voice input: hold/start recording, speak Japanese or English, stop recording.
+- Speech-to-text: backend transcribes recorded audio into text.
+- Tutor response: local LLM generates natural, conversation-style replies and corrections.
+- Text-to-speech: assistant reply is synthesized and can be replayed from chat bubbles.
+- Conversation flow: chat continues turn-by-turn with optional history save/load.
+- Learning controls: user can tune style, language, correction intensity, response length, and playback behavior.
+
+## Demo Showcase (exmaples)
+
+The repository includes demo assets in `exmaples/`.
+
+Preview images:
+
+![Main UI Showcase](./exmaples/fig0.png)
+![Settings Panel Showcase](./exmaples/fig1.png)
+
+Video:
+
+- [Voice Showcase (mov1.mov)](./exmaples/mov1.mov)
+
 ## Current Scope
 
 - Milestones M1-M10 are implemented.
